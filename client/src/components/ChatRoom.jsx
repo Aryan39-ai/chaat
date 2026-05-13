@@ -6,6 +6,8 @@ import DMPanel from './DMPanel';
 import MessageBubble from './MessageBubble';
 import EmojiButton from './EmojiButton';
 import ProfileModal from './ProfileModal';
+import CreateGroupModal from './CreateGroupModal';
+import JoinGroupModal from './JoinGroupModal';
 
 function playNotificationSound() {
   try {
@@ -39,6 +41,10 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
   const [hoveredUser, setHoveredUser] = useState(null);
   const [mobilePanel, setMobilePanel] = useState(null);
   const [showProfile, setShowProfile] = useState(false);
+  const [privateGroups, setPrivateGroups] = useState([]);
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [showJoinGroup, setShowJoinGroup] = useState(false);
+  const [groupNotif, setGroupNotif] = useState(null); // { groupName, invitedBy }
 
   const bottomRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -134,6 +140,33 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
       ));
     });
 
+    socket.on('private_groups_list', (groups) => {
+      setPrivateGroups(groups);
+    });
+
+    socket.on('group_invite', ({ groupName, invitedBy }) => {
+      setGroupNotif({ groupName, invitedBy });
+      socket.emit('get_private_groups');
+    });
+
+    socket.on('group_created', ({ name }) => {
+      handleJoinRoom(name);
+    });
+
+    socket.on('group_error', (msg) => {
+      window.dispatchEvent(new CustomEvent('group_error', { detail: msg }));
+      alert(msg);
+    });
+
+    socket.on('kicked_from_group', ({ groupName }) => {
+      setPrivateGroups(prev => prev.filter(g => g.name !== groupName));
+      if (currentRoomRef.current === groupName) {
+        setCurrentRoom('#general');
+        socket.emit('join_room', '#general');
+      }
+      alert(`You were removed from ${groupName}.`);
+    });
+
     return () => {
       socket.off('rooms_list');
       socket.off('new_room');
@@ -147,6 +180,11 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
       socket.off('dm_history');
       socket.off('typing');
       socket.off('avatar_updated');
+      socket.off('private_groups_list');
+      socket.off('group_invite');
+      socket.off('group_created');
+      socket.off('group_error');
+      socket.off('kicked_from_group');
     };
   }, [username]);
 
@@ -159,6 +197,29 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
     socket.emit('join_room', roomName);
     setUnreadRoomCounts(prev => ({ ...prev, [roomName]: 0 }));
     setMobilePanel(null);
+  }
+
+  function handleCreateGroup({ name, description, password, inviteList }) {
+    socket.emit('create_group', { name, description, password, inviteList });
+  }
+
+  function handleJoinPrivateGroup({ roomName, password }) {
+    socket.emit('join_private_group', { roomName, password });
+    setShowJoinGroup(false);
+  }
+
+  function handleInviteToGroup(group) {
+    const targetUsername = prompt(`Invite someone to ${group.name}:\nEnter their username:`);
+    if (targetUsername?.trim()) {
+      socket.emit('invite_to_group', { roomName: group.name, targetUsername: targetUsername.trim() });
+    }
+  }
+
+  function handleKickFromGroup(group) {
+    const targetUsername = prompt(`Kick a member from ${group.name}:\nEnter their username:`);
+    if (targetUsername?.trim()) {
+      socket.emit('kick_from_group', { roomName: group.name, targetUsername: targetUsername.trim() });
+    }
   }
 
   function handleOpenDm(targetUserObj) {
@@ -237,9 +298,15 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
         {/* Left side rooms channel list */}
         <RoomsSidebar
           roomsList={roomsList}
+          privateGroups={privateGroups}
           currentRoom={currentRoom}
+          currentUser={username}
           onJoinRoom={handleJoinRoom}
           onCreateRoom={name => socket.emit('create_room', name)}
+          onCreateGroup={() => setShowCreateGroup(true)}
+          onJoinGroup={() => setShowJoinGroup(true)}
+          onInviteToGroup={handleInviteToGroup}
+          onKickFromGroup={handleKickFromGroup}
           unreadCounts={unreadRoomCounts}
           mobileOpen={mobilePanel === 'sidebar'}
         />
@@ -496,6 +563,35 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
             })}
           </div>
         </div>
+
+        {/* Create group modal */}
+        {showCreateGroup && (
+          <CreateGroupModal
+            onClose={() => setShowCreateGroup(false)}
+            onCreate={handleCreateGroup}
+            onlineUsers={users}
+            currentUser={username}
+          />
+        )}
+
+        {/* Join group modal */}
+        {showJoinGroup && (
+          <JoinGroupModal
+            onClose={() => setShowJoinGroup(false)}
+            onJoin={handleJoinPrivateGroup}
+          />
+        )}
+
+        {/* Group invite notification */}
+        {groupNotif && (
+          <div className="group-notif animate-slide-up">
+            <span>🔒 <strong>{groupNotif.invitedBy}</strong> invited you to <strong>{groupNotif.groupName}</strong></span>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="group-notif-btn accept" onClick={() => { handleJoinRoom(groupNotif.groupName); setGroupNotif(null); }}>Join</button>
+              <button className="group-notif-btn" onClick={() => setGroupNotif(null)}>Dismiss</button>
+            </div>
+          </div>
+        )}
 
         {/* Profile modal */}
         {showProfile && (

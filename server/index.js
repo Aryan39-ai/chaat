@@ -7,14 +7,13 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const User = require('./models/User');
 const Message = require('./models/Message');
+const Room = require('./models/Room');
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 let mongoConnected = false;
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/chatapp', {
@@ -26,33 +25,28 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/chatapp', {
   console.warn('MongoDB unavailable, using in-memory fallback.', err.message);
 });
 
-const onlineUsers = {};
-const rooms = {
-  '#general': new Set(),
-  '#gaming': new Set(),
-  '#music': new Set(),
-  '#random': new Set()
+// ── In-memory state ──────────────────────────────────────
+const onlineUsers   = {};  // socketId → { username, avatarUrl, currentRoom, socketId }
+const roomSockets   = {    // roomName → Set of socketIds
+  '#general': new Set(), '#gaming': new Set(),
+  '#music': new Set(),   '#random': new Set()
 };
 const memoryMessages = [];
-const dmHistoryMap = {};
-const memoryUsers = {};
+const dmHistoryMap   = {};
+const memoryUsers    = {};
+const memoryGroups   = {}; // groupName → { name, isPrivate, passwordHash, members[], admins[], description, createdBy }
 
+// ── Helpers ──────────────────────────────────────────────
 function getDmKey(a, b) { return [a, b].sort().join(':'); }
 
 function getAvatarForUser(username) {
   const found = Object.values(onlineUsers).find(u => u.username === username);
-  if (found) return found.avatarUrl;
-  return `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
+  return found?.avatarUrl || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
 }
 
 function emitRoomUsers(roomName) {
-  const usersInRoom = [];
-  if (rooms[roomName]) {
-    for (const sid of rooms[roomName]) {
-      if (onlineUsers[sid]) usersInRoom.push(onlineUsers[sid]);
-    }
-  }
-  io.to(roomName).emit('room_users', usersInRoom);
+  const list = [...(roomSockets[roomName] || [])].map(sid => onlineUsers[sid]).filter(Boolean);
+  io.to(roomName).emit('room_users', list);
   io.emit('online_users', Object.values(onlineUsers));
 }
 
@@ -75,67 +69,70 @@ async function sendRoomHistory(socket, roomName) {
   socket.emit('room_history', history);
 }
 
+async function sendPrivateGroupsToUser(socket, username) {
+  let groups = [];
+  if (mongoConnected) {
+    try {
+      const docs = await Room.find({ isPrivate: true, members: username });
+      groups = docs.map(g => ({
+        name: g.name, description: g.description, createdBy: g.createdBy,
+        members: g.members, admins: g.admins, isAdmin: g.admins.includes(username)
+      }));
+    } catch (e) { console.error('Private groups fetch error:', e); }
+  } else {
+    groups = Object.values(memoryGroups)
+      .filter(g => g.isPrivate && g.members.includes(username))
+      .map(g => ({
+        name: g.name, description: g.description, createdBy: g.createdBy,
+        members: g.members, admins: g.admins, isAdmin: g.admins.includes(username)
+      }));
+  }
+  socket.emit('private_groups_list', groups);
+}
+
+// ── Socket.io ────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
-  // ── Auth ────────────────────────────────────────────────
+  // ── Auth ─────────────────────────────────────────────
   socket.on('register', async ({ username, password } = {}) => {
     if (!username?.trim() || !password?.trim())
       return socket.emit('auth_error', 'Username and password are required.');
-
     const name = username.trim();
     try {
       const passwordHash = await bcrypt.hash(password, 10);
       const avatarUrl = `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(name)}`;
-
       if (mongoConnected) {
-        if (await User.findOne({ username: name }))
-          return socket.emit('auth_error', 'Username already taken.');
+        if (await User.findOne({ username: name })) return socket.emit('auth_error', 'Username already taken.');
         await User.create({ username: name, passwordHash, avatarUrl });
       } else {
-        if (memoryUsers[name])
-          return socket.emit('auth_error', 'Username already taken.');
+        if (memoryUsers[name]) return socket.emit('auth_error', 'Username already taken.');
         memoryUsers[name] = { username: name, passwordHash, avatarUrl };
       }
-
       socket.emit('auth_success', { username: name, avatarUrl });
-    } catch (e) {
-      console.error('Register error:', e);
-      socket.emit('auth_error', 'Registration failed. Try again.');
-    }
+    } catch (e) { console.error('Register error:', e); socket.emit('auth_error', 'Registration failed.'); }
   });
 
   socket.on('login', async ({ username, password } = {}) => {
     if (!username?.trim() || !password?.trim())
       return socket.emit('auth_error', 'Username and password are required.');
-
     const name = username.trim();
     try {
-      const user = mongoConnected
-        ? await User.findOne({ username: name })
-        : memoryUsers[name] || null;
-
+      const user = mongoConnected ? await User.findOne({ username: name }) : memoryUsers[name] || null;
       if (!user) return socket.emit('auth_error', 'No account found. Please register first.');
       if (!user.passwordHash) return socket.emit('auth_error', 'Account has no password. Please register again.');
-
       const valid = await bcrypt.compare(password, user.passwordHash);
       if (!valid) return socket.emit('auth_error', 'Incorrect password.');
-
       socket.emit('auth_success', { username: name, avatarUrl: user.avatarUrl });
-    } catch (e) {
-      console.error('Login error:', e);
-      socket.emit('auth_error', 'Login failed. Try again.');
-    }
+    } catch (e) { console.error('Login error:', e); socket.emit('auth_error', 'Login failed.'); }
   });
 
-  // ── Join chat ────────────────────────────────────────────
+  // ── Join chat ────────────────────────────────────────
   socket.on('join', async (data) => {
     const username = typeof data === 'string' ? data : data?.username;
     const providedAvatar = typeof data === 'object' ? data?.avatarUrl : null;
     if (!username) return;
-
-    const avatarUrl = providedAvatar ||
-      `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
+    const avatarUrl = providedAvatar || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
 
     if (mongoConnected) {
       try { await User.findOneAndUpdate({ username }, { avatarUrl }, { upsert: true, new: true }); }
@@ -144,52 +141,49 @@ io.on('connection', (socket) => {
 
     const defaultRoom = '#general';
     onlineUsers[socket.id] = { username, avatarUrl, currentRoom: defaultRoom, socketId: socket.id };
-
     socket.join(defaultRoom);
-    rooms[defaultRoom].add(socket.id);
+    if (!roomSockets[defaultRoom]) roomSockets[defaultRoom] = new Set();
+    roomSockets[defaultRoom].add(socket.id);
 
-    socket.emit('rooms_list', Object.keys(rooms));
+    socket.emit('rooms_list', Object.keys(roomSockets).filter(r => !isPrivateGroup(r)));
     io.emit('user_joined', { username, avatarUrl, users: Object.values(onlineUsers) });
     emitRoomUsers(defaultRoom);
     sendRoomHistory(socket, defaultRoom);
+    sendPrivateGroupsToUser(socket, username);
   });
 
-  // ── Avatar update ────────────────────────────────────────
+  function isPrivateGroup(roomName) {
+    if (mongoConnected) return false; // can't sync check; handled via private_groups_list
+    return !!memoryGroups[roomName]?.isPrivate;
+  }
+
+  // ── Avatar ───────────────────────────────────────────
   socket.on('update_avatar', async (avatarDataUrl) => {
     if (typeof avatarDataUrl !== 'string' || !avatarDataUrl.startsWith('data:image/')) return;
     const user = onlineUsers[socket.id];
     if (!user) return;
-
     user.avatarUrl = avatarDataUrl;
-
     if (mongoConnected) {
       try { await User.findOneAndUpdate({ username: user.username }, { avatarUrl: avatarDataUrl }); }
       catch (e) { console.error('Avatar update error:', e); }
     } else if (memoryUsers[user.username]) {
       memoryUsers[user.username].avatarUrl = avatarDataUrl;
     }
-
     io.emit('avatar_updated', { username: user.username, avatarUrl: avatarDataUrl });
   });
 
-  // ── Rooms ────────────────────────────────────────────────
+  // ── Public rooms ─────────────────────────────────────
   socket.on('join_room', (roomName) => {
     const user = onlineUsers[socket.id];
     if (!user) return;
-
     const oldRoom = user.currentRoom;
-    if (oldRoom && rooms[oldRoom]) {
-      socket.leave(oldRoom);
-      rooms[oldRoom].delete(socket.id);
-      emitRoomUsers(oldRoom);
+    if (oldRoom && roomSockets[oldRoom]) {
+      socket.leave(oldRoom); roomSockets[oldRoom].delete(socket.id); emitRoomUsers(oldRoom);
     }
-
     let target = roomName.trim();
     if (!target.startsWith('#')) target = '#' + target;
-    if (!rooms[target]) { rooms[target] = new Set(); io.emit('rooms_list', Object.keys(rooms)); }
-
-    socket.join(target);
-    rooms[target].add(socket.id);
+    if (!roomSockets[target]) { roomSockets[target] = new Set(); io.emit('rooms_list', Object.keys(roomSockets).filter(r => !memoryGroups[r]?.isPrivate)); }
+    socket.join(target); roomSockets[target].add(socket.id);
     user.currentRoom = target;
     emitRoomUsers(target);
     sendRoomHistory(socket, target);
@@ -199,18 +193,179 @@ io.on('connection', (socket) => {
     if (!name?.trim()) return;
     let roomName = name.trim();
     if (!roomName.startsWith('#')) roomName = '#' + roomName;
-    if (!rooms[roomName]) {
-      rooms[roomName] = new Set();
+    if (!roomSockets[roomName]) {
+      roomSockets[roomName] = new Set();
       io.emit('new_room', roomName);
-      io.emit('rooms_list', Object.keys(rooms));
+      io.emit('rooms_list', Object.keys(roomSockets).filter(r => !memoryGroups[r]?.isPrivate));
     }
   });
 
-  // ── Messages ─────────────────────────────────────────────
-  socket.on('message', async (data) => {
+  // ── Private groups ───────────────────────────────────
+  socket.on('create_group', async ({ name, description, password, inviteList } = {}) => {
+    const user = onlineUsers[socket.id];
+    if (!user) return;
+    if (!name?.trim()) return socket.emit('group_error', 'Group name is required.');
+
+    let groupName = name.trim();
+    if (!groupName.startsWith('#')) groupName = '#' + groupName;
+
+    const passwordHash = password ? await bcrypt.hash(password, 10) : '';
+    const members = [...new Set([user.username, ...(inviteList || [])])];
+    const admins  = [user.username];
+
+    const groupData = { name: groupName, isPrivate: true, passwordHash, members, admins, description: description || '', createdBy: user.username };
+
+    if (mongoConnected) {
+      try {
+        const existing = await Room.findOne({ name: groupName });
+        if (existing) return socket.emit('group_error', 'A room with that name already exists.');
+        await Room.create(groupData);
+      } catch (e) { console.error('Create group error:', e); return socket.emit('group_error', 'Failed to create group.'); }
+    } else {
+      if (memoryGroups[groupName]) return socket.emit('group_error', 'A room with that name already exists.');
+      memoryGroups[groupName] = { ...groupData };
+    }
+
+    if (!roomSockets[groupName]) roomSockets[groupName] = new Set();
+
+    // Notify invited users who are online
+    for (const invitedUsername of (inviteList || [])) {
+      const invitedUser = Object.values(onlineUsers).find(u => u.username === invitedUsername);
+      if (invitedUser) {
+        io.to(invitedUser.socketId).emit('group_invite', { groupName, invitedBy: user.username, description: description || '' });
+        sendPrivateGroupsToUser(io.sockets.sockets.get(invitedUser.socketId), invitedUsername);
+      }
+    }
+
+    socket.emit('group_created', { name: groupName });
+    sendPrivateGroupsToUser(socket, user.username);
+  });
+
+  socket.on('join_private_group', async ({ roomName, password } = {}) => {
     const user = onlineUsers[socket.id];
     if (!user) return;
 
+    let group = null;
+    if (mongoConnected) {
+      try { group = await Room.findOne({ name: roomName, isPrivate: true }); }
+      catch (e) { console.error('Find group error:', e); }
+    } else {
+      group = memoryGroups[roomName] || null;
+    }
+
+    if (!group) return socket.emit('group_error', 'Group not found.');
+
+    // Already a member — join directly
+    if (group.members.includes(user.username)) {
+      return doJoinRoom(socket, user, roomName);
+    }
+
+    // Verify password
+    if (!group.passwordHash) return socket.emit('group_error', 'This group is invite-only. Ask an admin to invite you.');
+    const valid = await bcrypt.compare(password || '', group.passwordHash);
+    if (!valid) return socket.emit('group_error', 'Incorrect group password.');
+
+    // Add to members
+    if (mongoConnected) {
+      try { await Room.findOneAndUpdate({ name: roomName }, { $addToSet: { members: user.username } }); }
+      catch (e) { console.error('Add member error:', e); }
+    } else {
+      memoryGroups[roomName].members.push(user.username);
+    }
+
+    sendPrivateGroupsToUser(socket, user.username);
+    doJoinRoom(socket, user, roomName);
+  });
+
+  socket.on('invite_to_group', async ({ roomName, targetUsername } = {}) => {
+    const user = onlineUsers[socket.id];
+    if (!user) return;
+
+    let group = mongoConnected
+      ? await Room.findOne({ name: roomName, isPrivate: true }).catch(() => null)
+      : memoryGroups[roomName] || null;
+
+    if (!group) return socket.emit('group_error', 'Group not found.');
+    if (!group.admins.includes(user.username)) return socket.emit('group_error', 'Only admins can invite users.');
+    if (group.members.includes(targetUsername)) return socket.emit('group_error', `${targetUsername} is already a member.`);
+
+    if (mongoConnected) {
+      try { await Room.findOneAndUpdate({ name: roomName }, { $addToSet: { members: targetUsername } }); }
+      catch (e) { console.error('Invite error:', e); return socket.emit('group_error', 'Invite failed.'); }
+    } else {
+      memoryGroups[roomName].members.push(targetUsername);
+    }
+
+    const targetUser = Object.values(onlineUsers).find(u => u.username === targetUsername);
+    if (targetUser) {
+      const targetSocket = io.sockets.sockets.get(targetUser.socketId);
+      if (targetSocket) {
+        targetSocket.emit('group_invite', { groupName: roomName, invitedBy: user.username });
+        sendPrivateGroupsToUser(targetSocket, targetUsername);
+      }
+    }
+
+    socket.emit('group_invite_sent', { targetUsername, groupName: roomName });
+    sendPrivateGroupsToUser(socket, user.username);
+  });
+
+  socket.on('kick_from_group', async ({ roomName, targetUsername } = {}) => {
+    const user = onlineUsers[socket.id];
+    if (!user) return;
+
+    let group = mongoConnected
+      ? await Room.findOne({ name: roomName, isPrivate: true }).catch(() => null)
+      : memoryGroups[roomName] || null;
+
+    if (!group) return socket.emit('group_error', 'Group not found.');
+    if (!group.admins.includes(user.username)) return socket.emit('group_error', 'Only admins can kick members.');
+    if (targetUsername === user.username) return socket.emit('group_error', 'You cannot kick yourself.');
+
+    if (mongoConnected) {
+      try { await Room.findOneAndUpdate({ name: roomName }, { $pull: { members: targetUsername, admins: targetUsername } }); }
+      catch (e) { console.error('Kick error:', e); return socket.emit('group_error', 'Kick failed.'); }
+    } else {
+      memoryGroups[roomName].members = memoryGroups[roomName].members.filter(m => m !== targetUsername);
+      memoryGroups[roomName].admins  = memoryGroups[roomName].admins.filter(a => a !== targetUsername);
+    }
+
+    // Force kicked user out of the room socket
+    const kickedUser = Object.values(onlineUsers).find(u => u.username === targetUsername);
+    if (kickedUser) {
+      const kickedSocket = io.sockets.sockets.get(kickedUser.socketId);
+      if (kickedSocket) {
+        kickedSocket.leave(roomName);
+        if (roomSockets[roomName]) roomSockets[roomName].delete(kickedUser.socketId);
+        if (kickedUser.currentRoom === roomName) {
+          kickedUser.currentRoom = '#general';
+          kickedSocket.join('#general');
+          if (roomSockets['#general']) roomSockets['#general'].add(kickedUser.socketId);
+        }
+        kickedSocket.emit('kicked_from_group', { groupName: roomName });
+        sendPrivateGroupsToUser(kickedSocket, targetUsername);
+      }
+    }
+
+    socket.emit('kick_success', { targetUsername, groupName: roomName });
+    sendPrivateGroupsToUser(socket, user.username);
+  });
+
+  function doJoinRoom(socket, user, roomName) {
+    const oldRoom = user.currentRoom;
+    if (oldRoom && roomSockets[oldRoom]) {
+      socket.leave(oldRoom); roomSockets[oldRoom].delete(socket.id); emitRoomUsers(oldRoom);
+    }
+    if (!roomSockets[roomName]) roomSockets[roomName] = new Set();
+    socket.join(roomName); roomSockets[roomName].add(socket.id);
+    user.currentRoom = roomName;
+    emitRoomUsers(roomName);
+    sendRoomHistory(socket, roomName);
+  }
+
+  // ── Messages ─────────────────────────────────────────
+  socket.on('message', async (data) => {
+    const user = onlineUsers[socket.id];
+    if (!user) return;
     const msgObj = typeof data === 'string'
       ? { room: user.currentRoom, username: user.username, fromUsername: user.username,
           avatarUrl: user.avatarUrl, type: 'text', text: data, timestamp: new Date() }
@@ -219,32 +374,25 @@ io.on('connection', (socket) => {
           text: data.filename || data.text || '', imageData: data.data || '', timestamp: new Date() };
 
     if (mongoConnected) {
-      try {
-        await Message.create({ room: msgObj.room, fromUsername: msgObj.fromUsername,
-          type: msgObj.type, text: msgObj.text, imageData: msgObj.imageData, timestamp: msgObj.timestamp });
-      } catch (e) { console.error('Message save error:', e); }
-    } else {
-      memoryMessages.push(msgObj);
-    }
+      try { await Message.create({ room: msgObj.room, fromUsername: msgObj.fromUsername, type: msgObj.type, text: msgObj.text, imageData: msgObj.imageData, timestamp: msgObj.timestamp }); }
+      catch (e) { console.error('Message save error:', e); }
+    } else { memoryMessages.push(msgObj); }
 
     io.to(user.currentRoom).emit('message', msgObj);
   });
 
-  // ── DMs ──────────────────────────────────────────────────
+  // ── DMs ──────────────────────────────────────────────
   socket.on('send_dm', async ({ toSocketId, toUsername, text, type, data, filename }) => {
     const sender = onlineUsers[socket.id];
     if (!sender) return;
-
     const target = (toSocketId && onlineUsers[toSocketId])
       ? onlineUsers[toSocketId]
       : Object.values(onlineUsers).find(u => u.username === toUsername) || null;
-
     const targetUsername = target?.username || toUsername;
     if (!targetUsername) return;
 
     const dmKey = getDmKey(sender.username, targetUsername);
     if (!dmHistoryMap[dmKey]) dmHistoryMap[dmKey] = [];
-
     const dmObj = {
       room: dmKey, username: sender.username, fromUsername: sender.username,
       toUsername: targetUsername, avatarUrl: sender.avatarUrl,
@@ -252,17 +400,11 @@ io.on('connection', (socket) => {
       text: filename || text || '', imageData: data || '',
       timestamp: new Date(), isDm: true
     };
-
     dmHistoryMap[dmKey].push(dmObj);
-
     if (mongoConnected) {
-      try {
-        await Message.create({ room: dmKey, fromUsername: sender.username,
-          toUsername: targetUsername, type: dmObj.type, text: dmObj.text,
-          imageData: dmObj.imageData, timestamp: dmObj.timestamp });
-      } catch (e) { console.error('DM save error:', e); }
+      try { await Message.create({ room: dmKey, fromUsername: sender.username, toUsername: targetUsername, type: dmObj.type, text: dmObj.text, imageData: dmObj.imageData, timestamp: dmObj.timestamp }); }
+      catch (e) { console.error('DM save error:', e); }
     }
-
     socket.emit('receive_dm', dmObj);
     if (target?.socketId) io.to(target.socketId).emit('receive_dm', dmObj);
   });
@@ -270,19 +412,15 @@ io.on('connection', (socket) => {
   socket.on('get_dm_history', async (targetUsername) => {
     const sender = onlineUsers[socket.id];
     if (!sender || !targetUsername) return;
-
     const dmKey = getDmKey(sender.username, targetUsername);
     let history = [];
-
     if (mongoConnected) {
       try {
-        const docs = await Message.find({
-          $or: [
-            { fromUsername: sender.username, toUsername: targetUsername },
-            { fromUsername: targetUsername, toUsername: sender.username },
-            { room: dmKey }
-          ]
-        }).sort({ timestamp: 1 }).limit(50);
+        const docs = await Message.find({ $or: [
+          { fromUsername: sender.username, toUsername: targetUsername },
+          { fromUsername: targetUsername, toUsername: sender.username },
+          { room: dmKey }
+        ]}).sort({ timestamp: 1 }).limit(50);
         history = docs.map(d => ({
           room: dmKey, username: d.fromUsername, fromUsername: d.fromUsername,
           toUsername: d.toUsername, avatarUrl: getAvatarForUser(d.fromUsername),
@@ -290,24 +428,21 @@ io.on('connection', (socket) => {
           timestamp: d.timestamp, isDm: true
         }));
       } catch (e) { console.error('DM history error:', e); }
-    } else {
-      history = dmHistoryMap[dmKey] || [];
-    }
-
+    } else { history = dmHistoryMap[dmKey] || []; }
     socket.emit('dm_history', { targetUsername, messages: history });
   });
 
+  // ── Typing & disconnect ──────────────────────────────
   socket.on('typing', (isTyping) => {
     const user = onlineUsers[socket.id];
-    if (user?.currentRoom)
-      socket.broadcast.to(user.currentRoom).emit('typing', { username: user.username, isTyping });
+    if (user?.currentRoom) socket.broadcast.to(user.currentRoom).emit('typing', { username: user.username, isTyping });
   });
 
   socket.on('disconnect', () => {
     const user = onlineUsers[socket.id];
     if (user) {
       const oldRoom = user.currentRoom;
-      if (oldRoom && rooms[oldRoom]) { rooms[oldRoom].delete(socket.id); emitRoomUsers(oldRoom); }
+      if (oldRoom && roomSockets[oldRoom]) { roomSockets[oldRoom].delete(socket.id); emitRoomUsers(oldRoom); }
       delete onlineUsers[socket.id];
       io.emit('user_left', { username: user.username, users: Object.values(onlineUsers) });
       io.emit('online_users', Object.values(onlineUsers));
