@@ -1,12 +1,13 @@
-export default function RoomsSidebar({ 
-  roomsList = [], 
-  currentRoom, 
-  onJoinRoom, 
-  onCreateRoom, 
-  unreadCounts = {} 
+export default function RoomsSidebar({
+  roomsList = [],
+  currentRoom,
+  onJoinRoom,
+  onCreateRoom,
+  unreadCounts = {},
+  mobileOpen = false
 }) {
   return (
-    <div className="glass-panel" style={{
+    <div className={`glass-panel desktop-only mobile-drawer${mobileOpen ? ' open' : ''}`} style={{
       width: '220px',
       height: 'calc(100vh - 60px)',
       borderTop: 'none',

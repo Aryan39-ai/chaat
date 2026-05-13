@@ -5,6 +5,7 @@ import RoomsSidebar from './RoomsSidebar';
 import DMPanel from './DMPanel';
 import MessageBubble from './MessageBubble';
 import EmojiButton from './EmojiButton';
+import ProfileModal from './ProfileModal';
 
 function playNotificationSound() {
   try {
@@ -24,7 +25,7 @@ function playNotificationSound() {
   }
 }
 
-export default function ChatRoom({ username }) {
+export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout }) {
   const [messages, setMessages] = useState([]);
   const [users, setUsers] = useState([]);
   const [roomsList, setRoomsList] = useState([]);
@@ -36,6 +37,8 @@ export default function ChatRoom({ username }) {
   const [dmPanelUser, setDmPanelUser] = useState(null);
   const [dmMessagesMap, setDmMessagesMap] = useState({});
   const [hoveredUser, setHoveredUser] = useState(null);
+  const [mobilePanel, setMobilePanel] = useState(null);
+  const [showProfile, setShowProfile] = useState(false);
 
   const bottomRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -125,6 +128,12 @@ export default function ChatRoom({ username }) {
       );
     });
 
+    socket.on('avatar_updated', ({ username: who, avatarUrl: newAvatar }) => {
+      setUsers(prev => prev.map(u =>
+        u.username === who ? { ...u, avatarUrl: newAvatar } : u
+      ));
+    });
+
     return () => {
       socket.off('rooms_list');
       socket.off('new_room');
@@ -137,6 +146,7 @@ export default function ChatRoom({ username }) {
       socket.off('receive_dm');
       socket.off('dm_history');
       socket.off('typing');
+      socket.off('avatar_updated');
     };
   }, [username]);
 
@@ -148,6 +158,7 @@ export default function ChatRoom({ username }) {
     setCurrentRoom(roomName);
     socket.emit('join_room', roomName);
     setUnreadRoomCounts(prev => ({ ...prev, [roomName]: 0 }));
+    setMobilePanel(null);
   }
 
   function handleOpenDm(targetUserObj) {
@@ -207,17 +218,30 @@ export default function ChatRoom({ username }) {
   return (
     <div className="animated-bg" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       {/* Topbar */}
-      <Topbar currentRoom={currentRoom} onlineCount={users.length} />
+      <Topbar
+        currentRoom={currentRoom}
+        onlineCount={users.length}
+        username={username}
+        avatarUrl={avatarUrl}
+        onOpenProfile={() => setShowProfile(true)}
+        onLogout={onLogout}
+      />
 
       {/* Main workspace layout row */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', position: 'relative' }}>
+        {/* Backdrop for mobile drawers */}
+        {mobilePanel && (
+          <div className="mobile-overlay" onClick={() => setMobilePanel(null)} />
+        )}
+
         {/* Left side rooms channel list */}
-        <RoomsSidebar 
-          roomsList={roomsList} 
-          currentRoom={currentRoom} 
-          onJoinRoom={handleJoinRoom} 
-          onCreateRoom={name => socket.emit('create_room', name)} 
-          unreadCounts={unreadRoomCounts} 
+        <RoomsSidebar
+          roomsList={roomsList}
+          currentRoom={currentRoom}
+          onJoinRoom={handleJoinRoom}
+          onCreateRoom={name => socket.emit('create_room', name)}
+          unreadCounts={unreadRoomCounts}
+          mobileOpen={mobilePanel === 'sidebar'}
         />
 
         {/* Center Messages streaming canvas */}
@@ -232,7 +256,7 @@ export default function ChatRoom({ username }) {
           overflow: 'hidden'
         }}>
           {/* Messages Stream */}
-          <div style={{
+          <div className="messages-area" style={{
             flex: 1,
             overflowY: 'auto',
             padding: '20px 24px',
@@ -256,7 +280,7 @@ export default function ChatRoom({ username }) {
           </div>
 
           {/* Input Bar Form */}
-          <form onSubmit={handleSendMessage} style={{
+          <form className="input-bar" onSubmit={handleSendMessage} style={{
             padding: '12px 20px',
             background: 'var(--surface-base)',
             borderTop: '1px solid var(--border-color)',
@@ -343,7 +367,7 @@ export default function ChatRoom({ username }) {
         </div>
 
         {/* Right side Online Members panel */}
-        <div className="glass-panel" style={{
+        <div className={`glass-panel desktop-only mobile-members-drawer${mobilePanel === 'members' ? ' open' : ''}`} style={{
           width: '220px',
           height: 'calc(100vh - 60px)',
           borderTop: 'none',
@@ -473,16 +497,72 @@ export default function ChatRoom({ username }) {
           </div>
         </div>
 
-        {/* Dynamic DM Canvas slide-in overlay */}
-        {dmPanelUser && (
-          <DMPanel 
-            targetUser={dmPanelUser} 
-            onClose={() => setDmPanelUser(null)} 
-            messages={dmMessagesMap[dmPanelUser.username] || []} 
-            onSendMessage={handleSendDm} 
-            currentUser={username} 
+        {/* Profile modal */}
+        {showProfile && (
+          <ProfileModal
+            username={username}
+            avatarUrl={avatarUrl}
+            onClose={() => setShowProfile(false)}
+            onAvatarUpdate={(dataUrl) => {
+              onAvatarUpdate(dataUrl);
+              setShowProfile(false);
+            }}
           />
         )}
+
+        {/* Dynamic DM Canvas slide-in overlay */}
+        {dmPanelUser && (
+          <DMPanel
+            targetUser={dmPanelUser}
+            onClose={() => setDmPanelUser(null)}
+            messages={dmMessagesMap[dmPanelUser.username] || []}
+            onSendMessage={handleSendDm}
+            currentUser={username}
+          />
+        )}
+
+        {/* Mobile bottom navigation bar */}
+        <nav className="mobile-only mobile-bottom-nav">
+          <button
+            className={`mobile-nav-btn${mobilePanel === 'sidebar' ? ' active' : ''}`}
+            onClick={() => setMobilePanel(p => p === 'sidebar' ? null : 'sidebar')}
+          >
+            {Object.values(unreadRoomCounts).reduce((a, b) => a + b, 0) > 0 && (
+              <span className="badge">{Object.values(unreadRoomCounts).reduce((a, b) => a + b, 0)}</span>
+            )}
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            Channels
+          </button>
+
+          <button
+            className="mobile-nav-btn active"
+            onClick={() => setMobilePanel(null)}
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+              <polyline points="9 22 9 12 15 12 15 22" />
+            </svg>
+            Chat
+          </button>
+
+          <button
+            className={`mobile-nav-btn${mobilePanel === 'members' ? ' active' : ''}`}
+            onClick={() => setMobilePanel(p => p === 'members' ? null : 'members')}
+          >
+            {Object.values(unreadDmCounts).reduce((a, b) => a + b, 0) > 0 && (
+              <span className="badge">{Object.values(unreadDmCounts).reduce((a, b) => a + b, 0)}</span>
+            )}
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+            Members
+          </button>
+        </nav>
       </div>
     </div>
   );

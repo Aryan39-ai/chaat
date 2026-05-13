@@ -49,7 +49,7 @@ export default function DMPanel({
   }
 
   return (
-    <div className="glass-panel" style={{
+    <div className="glass-panel dm-panel" style={{
       position: 'fixed',
       top: '60px',
       right: 0,
