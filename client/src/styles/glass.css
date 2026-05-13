@@ -1,0 +1,40 @@
+/* Glassmorphism Reusable Utilities */
+.glass-panel {
+  background: var(--glass-bg, rgba(255, 255, 255, 0.08));
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.05);
+}
+
+.glass-bubble-other {
+  background: var(--bubble-other, rgba(255, 255, 255, 0.1));
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+}
+
+.glass-bubble-mine {
+  background: var(--accent-mine);
+  color: white;
+  border: none;
+}
+
+.glass-bubble-dm {
+  background: var(--accent-dm);
+  color: white;
+  border: none;
+}
+
+/* Base structural flex layouts for elements using glass */
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
