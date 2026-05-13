@@ -27,7 +27,7 @@ function playNotificationSound() {
   }
 }
 
-export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout }) {
+export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout, showLocalNotification, notifPermission, requestPermission }) {
   const [messages, setMessages] = useState([]);
   const [users, setUsers] = useState([]);
   const [roomsList, setRoomsList] = useState([]);
@@ -100,6 +100,15 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
 
       if (document.hidden && msg.fromUsername !== username && window.__soundEnabled !== false) {
         playNotificationSound();
+        // Trigger native OS notification banner
+        if (showLocalNotification) {
+          const preview = msg.type === 'image' ? '📷 Image' : (msg.text || '').slice(0, 100);
+          showLocalNotification(
+            `${msg.fromUsername} in ${msg.room}`,
+            preview,
+            msg.avatarUrl
+          );
+        }
       }
     });
 
@@ -121,6 +130,15 @@ export default function ChatRoom({ username, avatarUrl, onAvatarUpdate, onLogout
 
       if (document.hidden && dmObj.fromUsername !== username && window.__soundEnabled !== false) {
         playNotificationSound();
+        // Trigger native OS notification banner for DMs
+        if (showLocalNotification) {
+          const preview = dmObj.type === 'image' ? '📷 Image' : (dmObj.text || '').slice(0, 100);
+          showLocalNotification(
+            `DM from ${dmObj.fromUsername}`,
+            preview,
+            dmObj.avatarUrl
+          );
+        }
       }
     });
 

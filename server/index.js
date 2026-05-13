@@ -5,12 +5,33 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const webPush = require('web-push');
 const User = require('./models/User');
 const Message = require('./models/Message');
 const Room = require('./models/Room');
 
+// ── Web Push VAPID Configuration ─────────────────────────────────
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_EMAIL = process.env.VAPID_EMAIL || 'mailto:admin@chaat.app';
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webPush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  console.log('Web Push configured with VAPID keys');
+} else {
+  console.warn('VAPID keys not set — Web Push notifications disabled. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY env vars.');
+}
+
 const app = express();
 app.use(cors());
+
+// ── Express endpoint: serve VAPID public key to clients ──────────
+app.get('/vapid-public-key', (req, res) => {
+  if (!VAPID_PUBLIC_KEY) {
+    return res.status(503).json({ error: 'Push notifications not configured' });
+  }
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
@@ -41,7 +62,47 @@ function getDmKey(a, b) { return [a, b].sort().join(':'); }
 
 function getAvatarForUser(username) {
   const found = Object.values(onlineUsers).find(u => u.username === username);
-  return found?.avatarUrl || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
+  if (found) return found.avatarUrl;
+  return `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(username)}`;
+}
+
+// ── Web Push helper: send notification to all of a user's devices ──
+async function sendPushToUser(targetUsername, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !mongoConnected) return;
+
+  try {
+    const user = await User.findOne({ username: targetUsername });
+    if (!user || !user.pushSubscriptions || user.pushSubscriptions.length === 0) return;
+
+    const payloadStr = JSON.stringify(payload);
+    const expiredEndpoints = [];
+
+    for (const sub of user.pushSubscriptions) {
+      try {
+        await webPush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
+          payloadStr
+        );
+      } catch (err) {
+        // 410 Gone or 404 = subscription expired, remove it
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          expiredEndpoints.push(sub.endpoint);
+        } else {
+          console.error(`Push to ${targetUsername} failed:`, err.statusCode || err.message);
+        }
+      }
+    }
+
+    // Clean up expired subscriptions
+    if (expiredEndpoints.length > 0) {
+      await User.updateOne(
+        { username: targetUsername },
+        { $pull: { pushSubscriptions: { endpoint: { $in: expiredEndpoints } } } }
+      );
+    }
+  } catch (e) {
+    console.error('sendPushToUser error:', e);
+  }
 }
 
 function emitRoomUsers(roomName) {
@@ -407,6 +468,16 @@ io.on('connection', (socket) => {
     }
     socket.emit('receive_dm', dmObj);
     if (target?.socketId) io.to(target.socketId).emit('receive_dm', dmObj);
+
+    // Send Web Push notification to the target user (if they are offline/backgrounded)
+    const isTargetOnline = target?.socketId ? true : false;
+    sendPushToUser(targetUsername, {
+      title: `DM from ${sender.username}`,
+      body: dmObj.type === 'image' ? '📷 Image' : (dmObj.text || '').slice(0, 120),
+      icon: sender.avatarUrl || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(sender.username)}`,
+      url: '/',
+      tag: `dm-${sender.username}`
+    });
   });
 
   socket.on('get_dm_history', async (targetUsername) => {
@@ -446,6 +517,41 @@ io.on('connection', (socket) => {
       delete onlineUsers[socket.id];
       io.emit('user_left', { username: user.username, users: Object.values(onlineUsers) });
       io.emit('online_users', Object.values(onlineUsers));
+    }
+  });
+
+  // ── Push Subscription Management ────────────────────────────
+  socket.on('push_subscribe', async ({ username: subUsername, subscription }) => {
+    if (!subUsername || !subscription?.endpoint || !subscription?.keys) return;
+    if (!mongoConnected) return;
+
+    try {
+      // Remove any existing subscription with the same endpoint, then add the new one
+      await User.updateOne(
+        { username: subUsername },
+        { $pull: { pushSubscriptions: { endpoint: subscription.endpoint } } }
+      );
+      await User.updateOne(
+        { username: subUsername },
+        { $push: { pushSubscriptions: { endpoint: subscription.endpoint, keys: subscription.keys } } }
+      );
+      console.log(`Push subscription saved for ${subUsername}`);
+    } catch (e) {
+      console.error('push_subscribe error:', e);
+    }
+  });
+
+  socket.on('push_unsubscribe', async ({ username: subUsername, endpoint }) => {
+    if (!subUsername || !endpoint || !mongoConnected) return;
+
+    try {
+      await User.updateOne(
+        { username: subUsername },
+        { $pull: { pushSubscriptions: { endpoint } } }
+      );
+      console.log(`Push subscription removed for ${subUsername}`);
+    } catch (e) {
+      console.error('push_unsubscribe error:', e);
     }
   });
 });

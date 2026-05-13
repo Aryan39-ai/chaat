@@ -1,10 +1,22 @@
 import { useState, useEffect } from 'react';
 import AuthScreen from './components/AuthScreen';
 import ChatRoom from './components/ChatRoom';
+import InstallBanner from './components/InstallBanner';
+import useNotifications from './hooks/useNotifications';
 import { socket } from './socket';
 
 export default function App() {
   const [user, setUser] = useState(null);
+
+  const {
+    permission,
+    isStandalone,
+    isIOS,
+    pushSupported,
+    requestPermission,
+    showLocalNotification,
+    unsubscribe
+  } = useNotifications(user?.username);
 
   // Restore session from localStorage on load
   useEffect(() => {
@@ -21,6 +33,17 @@ export default function App() {
     }
   }, []);
 
+  // Prompt for notification permission after login
+  useEffect(() => {
+    if (user && permission === 'default') {
+      // Small delay so the user sees the app first
+      const timer = setTimeout(() => {
+        requestPermission();
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [user, permission, requestPermission]);
+
   function handleAuth(userData) {
     localStorage.setItem('chaat_user', JSON.stringify(userData));
     setUser(userData);
@@ -34,6 +57,7 @@ export default function App() {
   }
 
   function handleLogout() {
+    unsubscribe();
     localStorage.removeItem('chaat_user');
     socket.disconnect();
     setUser(null);
@@ -42,11 +66,17 @@ export default function App() {
   if (!user) return <AuthScreen onAuth={handleAuth} />;
 
   return (
-    <ChatRoom
-      username={user.username}
-      avatarUrl={user.avatarUrl}
-      onAvatarUpdate={handleAvatarUpdate}
-      onLogout={handleLogout}
-    />
+    <>
+      <ChatRoom
+        username={user.username}
+        avatarUrl={user.avatarUrl}
+        onAvatarUpdate={handleAvatarUpdate}
+        onLogout={handleLogout}
+        showLocalNotification={showLocalNotification}
+        notifPermission={permission}
+        requestPermission={requestPermission}
+      />
+      <InstallBanner isIOS={isIOS} isStandalone={isStandalone} />
+    </>
   );
 }
