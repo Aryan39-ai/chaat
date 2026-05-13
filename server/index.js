@@ -440,6 +440,27 @@ io.on('connection', (socket) => {
     } else { memoryMessages.push(msgObj); }
 
     io.to(user.currentRoom).emit('message', msgObj);
+
+    // Push to offline members of private groups
+    if (mongoConnected && VAPID_PUBLIC_KEY) {
+      try {
+        const group = await Room.findOne({ name: user.currentRoom, isPrivate: true });
+        if (group) {
+          const onlineUsernames = new Set(Object.values(onlineUsers).map(u => u.username));
+          const offlineMembers = group.members.filter(m => m !== user.username && !onlineUsernames.has(m));
+          const body = msgObj.type === 'text' ? (msgObj.text || '').slice(0, 100) : '📷 Image';
+          for (const member of offlineMembers) {
+            sendPushToUser(member, {
+              title: `${user.username} in ${user.currentRoom}`,
+              body,
+              icon: '/icons/icon-192.png',
+              url: '/',
+              tag: `room-${user.currentRoom}`
+            });
+          }
+        }
+      } catch (_) { /* not a private group or DB error, skip */ }
+    }
   });
 
   // ── DMs ──────────────────────────────────────────────
@@ -469,15 +490,17 @@ io.on('connection', (socket) => {
     socket.emit('receive_dm', dmObj);
     if (target?.socketId) io.to(target.socketId).emit('receive_dm', dmObj);
 
-    // Send Web Push notification to the target user (if they are offline/backgrounded)
-    const isTargetOnline = target?.socketId ? true : false;
-    sendPushToUser(targetUsername, {
-      title: `DM from ${sender.username}`,
-      body: dmObj.type === 'image' ? '📷 Image' : (dmObj.text || '').slice(0, 120),
-      icon: sender.avatarUrl || `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(sender.username)}`,
-      url: '/',
-      tag: `dm-${sender.username}`
-    });
+    // Push only if target has no active socket connection
+    const isTargetOnline = !!Object.values(onlineUsers).find(u => u.username === targetUsername);
+    if (!isTargetOnline) {
+      sendPushToUser(targetUsername, {
+        title: `💬 DM from ${sender.username}`,
+        body: dmObj.type === 'image' ? '📷 Sent you an image' : (dmObj.text || '').slice(0, 120),
+        icon: '/icons/icon-192.png',
+        url: '/',
+        tag: `dm-${sender.username}`
+      });
+    }
   });
 
   socket.on('get_dm_history', async (targetUsername) => {
